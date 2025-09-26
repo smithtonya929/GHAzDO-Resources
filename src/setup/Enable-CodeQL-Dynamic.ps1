@@ -1,0 +1,144 @@
+﻿<#
+.SYNOPSIS
+  One-click CodeQL enablement using dynamic pipelines.
+  - No YAML injection or manual pipeline creation.
+  - Enables Advanced Security + CodeQL for supported languages.
+
+.PARAMETERS
+  -OrgName: Azure DevOps organization name.
+  -ProjectName: Optional. If omitted, script runs org-wide.
+  -Pat: Personal Access Token with Advanced Security permissions.
+  -AgentPoolName: Optional. Defaults to 'AdvancedSecurityPool'.
+
+.EXAMPLE
+  # Project-scoped execution
+  .\Enable-CodeQL-Dynamic.ps1 -OrgName "contoso" -ProjectName "Payments" -Pat "<PAT>"
+
+  # Org-wide execution (all projects)
+  .\Enable-CodeQL-Dynamic.ps1 -OrgName "contoso" -Pat "<PAT>"
+#>
+
+param(
+  [Parameter(Mandatory = $true)]
+  [string] $OrgName,
+
+  [Parameter(Mandatory = $false)]
+  [string] $ProjectName,
+
+  [Parameter(Mandatory = $true)]
+  [string] $Pat,
+
+  [Parameter(Mandatory = $false)]
+  [string] $AgentPoolName = "AdvancedSecurityPool"
+)
+
+# ------------ Setup ------------
+$ErrorActionPreference = 'Stop'
+$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":" + $Pat))
+$headers = @{ Authorization = "Basic $base64AuthInfo"; "Content-Type" = "application/json" }
+$apiVersion = "7.1-preview.1"
+$enablementApiVersion = "7.2-preview.3"
+
+$report = New-Object System.Collections.Generic.List[psobject]
+$scriptStart = Get-Date
+
+# ------------ Get Repositories ------------
+try {
+    $reposUrl = if ([string]::IsNullOrWhiteSpace($ProjectName)) {
+        "https://dev.azure.com/$OrgName/_apis/git/repositories?api-version=$apiVersion"
+    } else {
+        "https://dev.azure.com/$OrgName/$ProjectName/_apis/git/repositories?api-version=$apiVersion"
+    }
+
+    $repos = (Invoke-RestMethod -Uri $reposUrl -Headers $headers).value
+} catch {
+    Write-Error "Failed to retrieve repositories: $($_.Exception.Message)"
+    return
+}
+
+# Group repositories by project for proper API calls
+# Priority order: 1) Use repo.project.name if available, 2) Fall back to ProjectName parameter, 3) Skip if neither
+$reposByProject = @{}
+foreach ($repo in $repos) {
+    # Determine project name with proper priority: repo object first, then parameter fallback
+    if ($repo.project -and -not [string]::IsNullOrWhiteSpace($repo.project.name)) {
+        # Repo has project info - use it (highest priority)
+        $thisProject = $repo.project.name
+    } elseif (-not [string]::IsNullOrWhiteSpace($ProjectName)) {
+        # No project info in repo object, but ProjectName parameter was provided - use as fallback
+        $thisProject = $ProjectName
+    } else {
+        # Neither repo project info nor ProjectName parameter available
+        Write-Warning "Skipping repository '$($repo.name)' - no project information available"
+        continue
+    }
+    
+    if (-not $reposByProject.ContainsKey($thisProject)) {
+        $reposByProject[$thisProject] = @()
+    }
+    $reposByProject[$thisProject] += $repo
+}
+
+# Process each project separately
+foreach ($projectKey in $reposByProject.Keys) {
+    $projectRepos = $reposByProject[$projectKey]
+    $enablementPayload = @()
+    
+    Write-Host "Processing project: $projectKey"
+    
+    foreach ($repo in $projectRepos) {
+        Write-Host "Preparing enablement for repo: $($repo.name)"
+
+        $enablementPayload += @{
+            repositoryId = $repo.id
+            advSecEnabled = $true
+            codeScanningEnabled = $true
+            advSecEnablementFeatures = @{
+                codeQLEnabled = $true
+            }
+        }
+
+        $report.Add([pscustomobject]@{
+            Timestamp  = (Get-Date)
+            Project    = $projectKey
+            Repository = $repo.name
+            RepoId     = $repo.id
+            Action     = "Prepared for enablement"
+            Result     = "Pending"
+        })
+    }
+
+    # ------------ Send Enablement Request for this project ------------
+    $enableUrl = "https://advsec.dev.azure.com/$OrgName/$projectKey/_apis/management/repositories/enablement?api-version=$enablementApiVersion"
+
+    try {
+        $body = $enablementPayload | ConvertTo-Json -Depth 5
+        Invoke-RestMethod -Uri $enableUrl -Method Patch -Headers $headers -Body $body
+        Write-Host "Successfully enabled Advanced Security features for all repositories in project: $projectKey"
+
+        # Update report entries for this project
+        foreach ($entry in $report) {
+            if ($entry.Project -eq $projectKey -and $entry.Result -eq "Pending") {
+                $entry.Result = "Success"
+                $entry.Action = "Enabled"
+            }
+        }
+    } catch {
+        Write-Warning "Enablement failed for project $projectKey : $($_.Exception.Message)"
+        
+        # Update report entries for this project
+        foreach ($entry in $report) {
+            if ($entry.Project -eq $projectKey -and $entry.Result -eq "Pending") {
+                $entry.Result = "Failed: $($_.Exception.Message)"
+                $entry.Action = "Enablement"
+            }
+        }
+    }
+}
+
+# ------------ Output CSV Report ------------
+$stamp = $scriptStart.ToString("yyyyMMdd-HHmmss")
+$outFile = "codeql-enable-report-$stamp.csv"
+$report | Export-Csv -Path $outFile -NoTypeInformation -Encoding UTF8
+Write-Host "================ DONE ================"
+Write-Host "Report written to: $outFile"
